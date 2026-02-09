@@ -10,7 +10,8 @@ Architecture:
       interrupt signals immediately.
     - The Retell call_id is used as LangGraph's thread_id so the
       checkpointer restores full conversation state across turns.
-    - graph/workflow.py is treated as IMMUTABLE (read-only).
+    - System prompt is injected INSIDE the graph (init_system node),
+      NOT prepended on every webhook call — preventing context pollution.
 """
 
 from __future__ import annotations
@@ -20,9 +21,9 @@ import json
 import logging
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 
-from graph.workflow import SYSTEM_PROMPT, compile_graph
+from graph.workflow import compile_graph
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -35,7 +36,7 @@ logger = logging.getLogger("omvyx")
 # App + Graph
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Omvyx Voice", version="1.0.0")
+app = FastAPI(title="Omvyx Voice", version="2.0.0")
 graph = compile_graph()  # single process — MemorySaver is fine
 
 # ---------------------------------------------------------------------------
@@ -66,11 +67,6 @@ async def retell_websocket(ws: WebSocket, call_id: str):
         The main while-loop only reads incoming WebSocket frames and
         dispatches work.  All graph inference runs inside asyncio.Task
         objects so the loop is always free to process interrupts.
-
-    Retell events handled:
-        - interaction_begin / call_details → optional agent greeting
-        - response_required               → cancel current + launch new task
-        - interrupt / update_only          → cancel current task immediately
     """
     await ws.accept()
     logger.info("WebSocket connected — call_id=%s", call_id)
@@ -89,12 +85,9 @@ async def retell_websocket(ws: WebSocket, call_id: str):
         """
         Run the LangGraph workflow and send the response to Retell.
 
-        This coroutine is always wrapped in asyncio.create_task() so it
-        can be cancelled when the user interrupts.
-
-        The graph is deterministic (no LLM token streaming), so we use
-        ainvoke and send the complete response.  The non-blocking Task
-        wrapper is what enables instant interrupt handling.
+        CLEAN HISTORY: The system prompt is injected by the graph's
+        init_system node on the first invocation.  Subsequent calls
+        only send the HumanMessage — no SYSTEM_PROMPT prepend.
         """
         try:
             # Extract last user utterance from transcript
@@ -110,14 +103,14 @@ async def retell_websocket(ws: WebSocket, call_id: str):
             # Config with thread_id for checkpointer persistence
             config = {"configurable": {"thread_id": cid}}
 
-            # Input state: inject SYSTEM_PROMPT + user message
+            # Input state: ONLY the user message + call_id.
+            # System prompt is handled inside the graph (init_system node).
             input_state = {
-                "messages": [SYSTEM_PROMPT, HumanMessage(content=user_text)],
+                "messages": [HumanMessage(content=user_text)],
                 "call_id": cid,
             }
 
-            # Run the graph (deterministic nodes — adapted from
-            # astream_events to ainvoke since there's no LLM streaming)
+            # Run the graph
             result = await graph.ainvoke(input_state, config=config)
 
             # Extract the last AI message as the agent reply
@@ -145,7 +138,6 @@ async def retell_websocket(ws: WebSocket, call_id: str):
             })
 
         except asyncio.CancelledError:
-            # Interrupted by user — exit silently
             logger.info(
                 "Generation cancelled — call_id=%s response_id=%s", cid, response_id
             )
@@ -163,8 +155,6 @@ async def retell_websocket(ws: WebSocket, call_id: str):
             raw = await ws.receive_text()
             data: dict = json.loads(raw)
 
-            # Support both Retell's native "interaction_type" field
-            # and the "event" + "type" wrapper format
             interaction_type = data.get("interaction_type", "")
             event = data.get("event", "")
             update_type = data.get("type", "")
@@ -175,7 +165,6 @@ async def retell_websocket(ws: WebSocket, call_id: str):
 
                 initiator = data.get("initiator", "")
                 if initiator == "agent":
-                    # Agent-initiated call: launch greeting task
                     current_task = asyncio.create_task(
                         handle_generation([], 0, call_id)
                     )
@@ -185,11 +174,9 @@ async def retell_websocket(ws: WebSocket, call_id: str):
                 interaction_type == "response_required"
                 or (event == "interaction_update" and update_type == "response_required")
             ):
-                # Step 1: Cancel running generation (non-blocking)
                 if current_task and not current_task.done():
                     current_task.cancel()
 
-                # Step 2: Launch new generation task
                 transcript = data.get("transcript", [])
                 response_id = data.get("response_id", 0)
 
@@ -206,14 +193,12 @@ async def retell_websocket(ws: WebSocket, call_id: str):
                 interaction_type == "update_only"
                 or (event == "interaction_update" and update_type == "interrupt")
             ):
-                # Immediate cancellation — do NOT send anything to the socket
                 if current_task and not current_task.done():
                     current_task.cancel()
                 logger.info("Interrupt received — call_id=%s", call_id)
 
             # ========= REMINDER REQUIRED =========
             elif interaction_type == "reminder_required":
-                # Agent hasn't spoken for a while — re-trigger generation
                 if current_task and not current_task.done():
                     current_task.cancel()
 
@@ -238,7 +223,6 @@ async def retell_websocket(ws: WebSocket, call_id: str):
     except Exception:
         logger.exception("WebSocket error — call_id=%s", call_id)
     finally:
-        # Clean up any in-flight task
         if current_task and not current_task.done():
             current_task.cancel()
 
